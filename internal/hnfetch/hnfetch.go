@@ -63,10 +63,24 @@ type HNFetch interface {
 	Init() error
 	GetPosts(cursor int, fetchSize int) []HNWhoIsHiringPost
 	LastWhoIsHiring() (*HNWhosHiring, error)
+	BackgroundCheck()
 }
 
 type HNAPI struct {
 	existingWhoIsHiring *HNWhosHiring
+}
+
+func (s *HNAPI) BackgroundCheck() {
+	for {
+		slog.Info("Entering the background check loop")
+		time.Sleep(60 * time.Second)
+		post, err := s.LastWhoIsHiring()
+		if err != nil {
+			slog.Error("Error in background check", err)
+			continue
+		}
+		s.existingWhoIsHiring = post
+	}
 }
 
 func (s *HNAPI) findCursorIndex(cursor int) int {

@@ -46,5 +46,6 @@ func main() {
 		w.Write(jData)
 	}
 	http.HandleFunc("/latest-jobs/{fetchSize}/{cursor}", latestJobsHandler)
+	go hnFetch.BackgroundCheck()
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
