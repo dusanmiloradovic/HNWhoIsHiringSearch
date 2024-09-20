@@ -6,11 +6,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 )
 
 const searchApi = "https://hn.algolia.com/api/v1/search_by_date?query=%22who%20is%20hiring%22&tags=story"
 const itemApi = "https://hacker-news.firebaseio.com/v0/item/%d.json"
+const checkingPeriod = 300000
+const maxFetchSize = 500
 
 type HNWhosHiring struct {
 	Title                string // like May 2024
@@ -34,10 +37,11 @@ type HNWhoIsHiringPost struct {
 	Posted      int
 	Description string
 	Remote      bool
+	Order       int
 }
 
 var whoisHiringChan = make(chan *HHWhoIsHiringWithError)
-var jobMap = make(map[int]*HNWhoIsHiringPost)
+var jobMap sync.Map
 
 type SearchAPIResponse struct {
 	Hits []struct {
@@ -95,8 +99,12 @@ func (s *HNAPI) findCursorIndex(cursor int) int {
 	return -1 // cursor not found, start from the beginning
 }
 
-func (s *HNAPI) GetPosts(cursor int, fetchSize int) []HNWhoIsHiringPost {
-	var ret []HNWhoIsHiringPost
+func (s *HNAPI) GetPosts(cursor int, _fetchSize int) []HNWhoIsHiringPost {
+	fetchSize := _fetchSize
+	if fetchSize > maxFetchSize {
+		fetchSize = maxFetchSize
+	}
+	ret := make([]HNWhoIsHiringPost, fetchSize)
 	if s.existingWhoIsHiring == nil {
 		_, err := s.LastWhoIsHiring()
 		if err != nil {
@@ -104,12 +112,11 @@ func (s *HNAPI) GetPosts(cursor int, fetchSize int) []HNWhoIsHiringPost {
 			return ret
 		}
 	}
-	posts := make(chan *HNWhoIsHiringPost)
+	posts := make(chan *HNWhoIsHiringPost, fetchSize)
 	cursorInd := s.findCursorIndex(cursor)
-	for i := cursorInd + 1; i < len(s.existingWhoIsHiring.childPostIds); i++ {
-		if i == (fetchSize - cursorInd - 1) {
-			break
-		}
+	fetched := 0
+	for i := cursorInd + 1; i < len(s.existingWhoIsHiring.childPostIds) && fetched < fetchSize; i++ {
+		fetched++
 		go s.getPost(posts, i)
 	}
 	l := len(s.existingWhoIsHiring.childPostIds) - cursorInd - 1
@@ -118,15 +125,21 @@ func (s *HNAPI) GetPosts(cursor int, fetchSize int) []HNWhoIsHiringPost {
 	}
 
 	for i := 0; i < l; i++ {
-		ret = append(ret, *(<-posts))
+		post := <-posts
+		ret[post.Order-cursorInd-1] = *post
 	}
-	return ret
+	return ret[:l]
 }
 
 func (s *HNAPI) getPost(posts chan *HNWhoIsHiringPost, i int) {
 	childPosts := s.existingWhoIsHiring.childPostIds
-	job := jobMap[childPosts[i]]
+	if childPosts[i] == 0 {
+		posts <- nil
+		return
+	}
+	job, _ := jobMap.Load(childPosts[i])
 	if job == nil {
+
 		url := fmt.Sprintf(itemApi, childPosts[i])
 		resp, err := http.Get(url)
 		if err != nil {
@@ -156,12 +169,13 @@ func (s *HNAPI) getPost(posts chan *HNWhoIsHiringPost, i int) {
 			Remote:      parser.IsRemote(),
 			Description: parser.GetDescription(),
 			Posted:      int(response.Time),
+			Order:       i,
 		}
-		jobMap[childPosts[i]] = &post
+		jobMap.Store(childPosts[i], &post)
 		posts <- &post
 	} else {
 		slog.Debug("Cache hit")
-		posts <- job
+		posts <- job.(*HNWhoIsHiringPost)
 	}
 }
 
@@ -200,7 +214,8 @@ func (s *HNAPI) findLastWhosHiringPost() {
 }
 
 func (s *HNAPI) LastWhoIsHiring() (*HNWhosHiring, error) {
-	if s.existingWhoIsHiring != nil && s.existingWhoIsHiring.lastTimestampChecked-time.Now().UnixMilli() < 60000 {
+
+	if s.existingWhoIsHiring != nil && s.existingWhoIsHiring.lastTimestampChecked-time.Now().UnixMilli() < checkingPeriod {
 		return s.existingWhoIsHiring, nil
 	}
 	go s.findLastWhosHiringPost()
